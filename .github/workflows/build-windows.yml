@@ -1,0 +1,152 @@
+name: Build Windows
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Tag existente para gerar e publicar (ex. v0.1.0)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: pwsh
+    outputs:
+      release_tag: ${{ steps.release.outputs.tag }}
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+
+    steps:
+      - name: Validar tag informada
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if ($env:RELEASE_TAG -cnotlike 'v*') {
+            throw 'Informe uma tag que comece com v.'
+          }
+          git check-ref-format "refs/tags/$env:RELEASE_TAG"
+
+      - name: Baixar código
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.release_tag) || '' }}
+          fetch-depth: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && '0' || '1' }}
+          persist-credentials: false
+
+      - name: Configurar Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+          architecture: x64
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Instalar dependências
+        run: |
+          python -m venv .venv
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\.venv\Scripts\python.exe -m pip install -e .
+
+      - name: Rodar testes
+        run: .\.venv\Scripts\python.exe -m unittest discover -s tests
+
+      - name: Selecionar tag para publicação
+        id: release
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REF_TYPE: ${{ github.ref_type }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          $tag = $env:RELEASE_TAG
+          if ($env:REF_TYPE -ne 'tag' -and $env:EVENT_NAME -ne 'workflow_dispatch') {
+            $tag = git tag --merged HEAD --sort=-version:refname --list 'v*' |
+              Select-Object -First 1
+            if (!$tag) { exit 0 }
+
+            $release = gh release view $tag --json assets,isDraft 2>$null
+            if ($LASTEXITCODE -eq 0) {
+              $release = $release | ConvertFrom-Json
+              if (!$release.isDraft -and $release.assets.name -contains 'Controle-ELK.exe') {
+                exit 0
+              }
+            }
+
+            git checkout --detach "refs/tags/$tag"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            .\.venv\Scripts\python.exe -m pip install -e .
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            .\.venv\Scripts\python.exe -m unittest discover -s tests
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Gerar executável
+        if: steps.release.outputs.tag != ''
+        run: |
+          $python = '.\.venv\Scripts\python.exe'
+          & $python -m pip install 'PyInstaller==6.22.3'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Path build -Force | Out-Null
+          $icon = "$PWD/controle_elk/ui/assets/controle-elk.ico"
+          & $python -m PyInstaller --onefile --windowed --name Controle-ELK `
+            --icon $icon --specpath build --workpath build/pyinstaller --distpath dist `
+            --paths "$PWD" --add-data "${icon}:controle_elk/ui/assets" `
+            --hidden-import bleak.backends.winrt.client --hidden-import bleak.backends.winrt.scanner `
+            --collect-submodules winrt --add-data "$PWD/LICENSE:." controle_elk/ui/launch.py
+
+      - name: Guardar executável
+        if: steps.release.outputs.tag != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: Controle-ELK-windows-x64
+          path: dist/Controle-ELK.exe
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+
+  publish:
+    if: needs.test-and-build.outputs.release_tag != ''
+    needs: test-and-build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: release-${{ needs.test-and-build.outputs.release_tag }}
+    steps:
+      - name: Baixar executável
+        uses: actions/download-artifact@v8
+        with:
+          name: Controle-ELK-windows-x64
+          path: dist
+
+      - name: Publicar release da tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.test-and-build.outputs.release_tag }}
+        run: |
+          exe=dist/Controle-ELK.exe
+          if release=$(gh release view "$RELEASE_TAG" --json assets,isDraft); then
+            if ! jq -e '.assets | any(.name == "Controle-ELK.exe")' <<< "$release" >/dev/null; then
+              gh release upload "$RELEASE_TAG" "$exe"
+            fi
+            if jq -e '.isDraft' <<< "$release" >/dev/null; then
+              gh release edit "$RELEASE_TAG" --draft=false
+            fi
+          else
+            gh release create "$RELEASE_TAG" "$exe" --verify-tag --generate-notes --title "Controle ELK $RELEASE_TAG"
+          fi

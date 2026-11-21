@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "controle-elk"
+version = "0.1.0"
+description = "Controle local de fitas ELK-BLEDOB e ELK-BLEDOM no Windows"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = ["bleak>=3.1,<4"]
+
+[project.scripts]
+controle-elk-cli = "controle_elk.cli:main"
+
+[project.gui-scripts]
+controle-elk = "controle_elk.ui.launch:main"
+
+[tool.setuptools.packages.find]
+include = ["controle_elk*"]
+
+[tool.setuptools.package-data]
+"controle_elk.ui" = ["assets/*.ico"]
+
